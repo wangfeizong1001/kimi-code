@@ -1,0 +1,160 @@
+name: Sync from upstream
+
+# 自动从 MoonshotAI/kimi-code (upstream) 同步到本 fork
+# 触发条件:
+#   1. 每天 UTC 02:00 (北京时间 10:00) 定时运行
+#   2. 手动触发 (支持 dry-run 模式)
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run 模式 (只检查不推送)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      force_reset:
+        description: '强制重置到 upstream (覆盖 fork 的本地修改,慎用)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+env:
+  UPSTREAM_REPO: MoonshotAI/kimi-code
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }} --tags --force
+
+      - name: Compare fork vs upstream
+        id: check
+        run: |
+          LOCAL_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+          echo "local_sha=$LOCAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "new_count=0" >> "$GITHUB_OUTPUT"
+            echo "✅ Already up to date with upstream"
+          else
+            NEW_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }})
+            BEHIND_COUNT=$(git rev-list --count upstream/${{ env.UPSTREAM_BRANCH }}..HEAD || echo 0)
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+            echo "new_count=$NEW_COUNT" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND_COUNT" >> "$GITHUB_OUTPUT"
+            echo "🔄 Fork 落后 upstream $NEW_COUNT 个提交,领先 $BEHIND_COUNT 个本地提交"
+          fi
+
+      - name: Build new commits summary
+        if: steps.check.outputs.has_new == 'true'
+        run: |
+          {
+            echo "### 📋 Upstream 新增提交列表"
+            echo ""
+            echo "| # | Commit | 类型 | 标题 |"
+            echo "|---|--------|------|------|"
+            git log HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --reverse --format="| %h | %h | %s |" | sed -E 's/^\| ([0-9a-f]+) \| ([0-9a-f]+) \| (feat|fix|docs|refactor|test|ci|chore|perf|style|build|revert)(\([^)]*\))?: (.*) \|/| $((++n)) | \2 | \3\4 | \5 |/'
+            echo ""
+            echo "**统计**:${{ steps.check.outputs.new_count }} 个新提交 (upstream ${{ env.UPSTREAM_BRANCH }})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 同时输出到日志
+          echo "===== 新增提交 (按时间正序) ====="
+          git log HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --reverse --format='%h | %cI | %s'
+
+      - name: Force reset to upstream (覆盖模式)
+        if: steps.check.outputs.has_new == 'true' && github.event.inputs.force_reset == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          echo "⚠️ 强制重置 fork ${{ env.FORK_BRANCH }} 到 upstream/${{ env.UPSTREAM_BRANCH }}"
+          git reset --hard upstream/${{ env.UPSTREAM_BRANCH }}
+
+      - name: Merge upstream (默认模式)
+        if: steps.check.outputs.has_new == 'true' && github.event.inputs.force_reset != 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          echo "🔗 Merge upstream/${{ env.UPSTREAM_BRANCH }} into ${{ env.FORK_BRANCH }}"
+          if ! git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit; then
+            echo "❌ Merge 冲突!中止合并"
+            git merge --abort
+            echo ""
+            echo "冲突文件:"
+            git diff --name-only --diff-filter=U
+            echo ""
+            echo "💡 建议:手动解决冲突或使用 force_reset 模式"
+            exit 1
+          fi
+          echo "✅ Merge 成功"
+
+      - name: Push to fork
+        if: steps.check.outputs.has_new == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          if [ "${{ github.event.inputs.force_reset }}" = "true" ]; then
+            echo "推送 (force-with-lease) 到 fork"
+            git push --force-with-lease origin ${{ env.FORK_BRANCH }}
+          else
+            echo "推送到 fork"
+            git push origin ${{ env.FORK_BRANCH }}
+          fi
+          echo "✅ 推送完成"
+
+      - name: Final summary
+        if: always()
+        run: |
+          {
+            echo "## 🔄 Upstream Sync Report"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| Upstream | [${{ env.UPSTREAM_REPO }}](https://github.com/${{ env.UPSTREAM_REPO }}) @ ${{ env.UPSTREAM_BRANCH }} |"
+            echo "| Fork | [${{ github.repository }}](https://github.com/${{ github.repository }}) @ ${{ env.FORK_BRANCH }} |"
+            echo "| Fork HEAD | \`${{ steps.check.outputs.local_sha }}\` |"
+            echo "| Upstream HEAD | \`${{ steps.check.outputs.upstream_sha }}\` |"
+            echo "| New commits | ${{ steps.check.outputs.new_count || 0 }} |"
+            echo "| Dry-run | ${{ github.event.inputs.dry_run || 'false' }} |"
+            echo "| Force reset | ${{ github.event.inputs.force_reset || 'false' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.check.outputs.has_new }}" = "false" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ **Fork 已与 upstream 同步,无需操作**" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "🔍 **Dry-run 模式:仅检查未推送**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ **同步完成**" >> "$GITHUB_STEP_SUMMARY"
+          fi
